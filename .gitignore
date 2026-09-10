@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local Power BI Desktop state
+*.user
+*.pbix
+bin/
+obj/
+*.zip
+
+# Local data-generation scripts (not published)
+generate_data.py
+add_conversion_dates.py

@@ -1,0 +1,244 @@
+// =============================================================================
+// measures.dax
+// Power BI semantic model measures for the Meridian Lead Exchange analysis.
+//
+// Create these in a dedicated measure table (Home > Enter Data > name it
+// "_Measures", load one blank column, then hide that column). Keeping measures
+// out of the fact table stops them from being mistaken for columns and keeps
+// the field list readable as the model grows.
+//
+// Convention used throughout: measures reference other measures rather than
+// repeating aggregation logic. Total Cost is defined once; CPA, ROI, and every
+// variance measure consume it. Changing the cost definition then changes it
+// everywhere, which is the whole reason to build a semantic model instead of
+// twelve separate visuals with their own arithmetic.
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// BASE MEASURES
+// -----------------------------------------------------------------------------
+
+Total Leads =
+COUNTROWS ( fct_leads )
+
+
+Conversions =
+SUM ( fct_leads[is_converted] )
+
+
+Total Cost =
+SUM ( fct_leads[acquisition_cost] )
+
+
+Total Revenue =
+SUM ( fct_leads[commission_revenue] )
+
+
+// -----------------------------------------------------------------------------
+// DERIVED PERFORMANCE MEASURES
+//
+// DIVIDE is used rather than the "/" operator throughout. DIVIDE returns BLANK
+// on a zero denominator instead of an error, so a slicer selection that filters
+// down to a segment with no conversions renders an empty card rather than
+// breaking every visual on the page.
+// -----------------------------------------------------------------------------
+
+Conversion Rate =
+DIVIDE ( [Conversions], [Total Leads] )
+// Format as percentage in the Measure tools ribbon, 1 decimal place.
+
+
+CPA =
+DIVIDE ( [Total Cost], [Conversions] )
+// Cost per acquisition. Blank when a segment has produced no conversions,
+// which is correct: CPA is undefined, not infinite.
+
+
+Net Contribution =
+[Total Revenue] - [Total Cost]
+
+
+ROI =
+DIVIDE ( [Net Contribution], [Total Cost] )
+
+
+Revenue Per Lead =
+DIVIDE ( [Total Revenue], [Total Leads] )
+// Useful alongside CPA because it is defined even for zero-conversion segments,
+// so it degrades more gracefully in deep slicer selections.
+
+
+// -----------------------------------------------------------------------------
+// SHARE-OF-TOTAL MEASURES
+//
+// ALLSELECTED removes the filter from the current visual row while respecting
+// slicers applied to the page. This is what makes a "% of spend" column total
+// to 100% within the visual rather than against the entire dataset.
+// -----------------------------------------------------------------------------
+
+% of Total Spend =
+DIVIDE (
+    [Total Cost],
+    CALCULATE ( [Total Cost], ALLSELECTED ( fct_leads ) )
+)
+
+
+% of Total Conversions =
+DIVIDE (
+    [Conversions],
+    CALCULATE ( [Conversions], ALLSELECTED ( fct_leads ) )
+)
+
+
+// Efficiency index. Above 1.0 means the segment delivers a greater share of
+// conversions than the share of budget it consumes. This single measure is
+// what makes the Display versus Affiliate story legible without a table.
+Efficiency Index =
+DIVIDE ( [% of Total Conversions], [% of Total Spend] )
+
+
+// -----------------------------------------------------------------------------
+// DATA QUALITY MEASURES
+//
+// Surfacing imputation rates on the dashboard itself is deliberate. A metric
+// built partly on imputed inputs should say so where it is consumed, not only
+// in documentation nobody opens.
+// -----------------------------------------------------------------------------
+
+Imputed Cost Records =
+CALCULATE ( [Total Leads], fct_leads[is_cost_imputed] = TRUE )
+
+
+% Cost Imputed =
+DIVIDE ( [Imputed Cost Records], [Total Leads] )
+
+
+Data Quality Flag =
+IF (
+    [% Cost Imputed] > 0.10,
+    "Review: over 10% of cost values imputed",
+    "OK"
+)
+// Drives conditional formatting on a dashboard card. Threshold is a judgement
+// call, set here at the point where imputation starts to move segment CPA
+// materially rather than at any statistical boundary.
+
+
+// -----------------------------------------------------------------------------
+// TIME INTELLIGENCE
+//
+// All of these require dim_date to be marked as a date table
+// (Table tools > Mark as date table > date_key).
+// -----------------------------------------------------------------------------
+
+Leads PW =
+CALCULATE ( [Total Leads], DATEADD ( dim_date[date_key], -7, DAY ) )
+// Prior week, for a like-for-like comparison on a weekly reporting cadence.
+
+
+Leads WoW Change =
+[Total Leads] - [Leads PW]
+
+
+Leads WoW % =
+DIVIDE ( [Leads WoW Change], [Leads PW] )
+
+
+Net Contribution Running Total =
+CALCULATE (
+    [Net Contribution],
+    FILTER (
+        ALLSELECTED ( dim_date[date_key] ),
+        dim_date[date_key] <= MAX ( dim_date[date_key] )
+    )
+)
+// Cumulative margin burn across the period. Reads far better than daily net on
+// a line chart, because it shows the compounding loss rather than daily noise.
+
+
+// -----------------------------------------------------------------------------
+// STATISTICAL CONFIDENCE
+//
+// Ports the Wilson score interval from the SQL layer into the semantic model so
+// that confidence bounds respond to slicers. A conversion rate shown without
+// its interval invites over-reading of small segments, which was the central
+// analytical flaw in the original Excel version of this analysis.
+//
+//   centre = (p + z^2/2n) / (1 + z^2/n)
+//   half   = z * sqrt( p(1-p)/n + z^2/4n^2 ) / (1 + z^2/n)
+// -----------------------------------------------------------------------------
+
+Conversion Rate CI Lower =
+VAR n          = [Total Leads]
+VAR p          = [Conversion Rate]
+VAR z          = 1.96
+VAR Denominator = 1 + DIVIDE ( z * z, n )
+VAR Centre      = DIVIDE ( p + DIVIDE ( z * z, 2 * n ), Denominator )
+VAR HalfWidth   =
+    DIVIDE (
+        z * SQRT ( DIVIDE ( p * ( 1 - p ), n ) + DIVIDE ( z * z, 4 * n * n ) ),
+        Denominator
+    )
+RETURN
+    IF ( n > 0, MAX ( Centre - HalfWidth, 0 ) )
+
+
+Conversion Rate CI Upper =
+VAR n          = [Total Leads]
+VAR p          = [Conversion Rate]
+VAR z          = 1.96
+VAR Denominator = 1 + DIVIDE ( z * z, n )
+VAR Centre      = DIVIDE ( p + DIVIDE ( z * z, 2 * n ), Denominator )
+VAR HalfWidth   =
+    DIVIDE (
+        z * SQRT ( DIVIDE ( p * ( 1 - p ), n ) + DIVIDE ( z * z, 4 * n * n ) ),
+        Denominator
+    )
+RETURN
+    IF ( n > 0, MIN ( Centre + HalfWidth, 1 ) )
+
+
+Evidence Strength =
+VAR n           = [Total Leads]
+VAR Successes   = [Conversions]
+VAR IntervalWidth = [Conversion Rate CI Upper] - [Conversion Rate CI Lower]
+RETURN
+    SWITCH (
+        TRUE (),
+        n = 0,                              BLANK (),
+        Successes < 5 || n < 50,            "Insufficient sample",
+        IntervalWidth <= 0.12,              "Actionable",
+        "Directional"
+    )
+// Mirrors the SQL classification exactly. Uses the conventional minimum of five
+// observed successes for inference on a proportion, rather than interval width
+// alone, because a segment with one conversion produces a deceptively narrow
+// interval simply by sitting near zero.
+
+
+// -----------------------------------------------------------------------------
+// DYNAMIC TITLES
+//
+// Bind to a visual's title via Format > Title > fx > Field value. Makes an
+// exported screenshot self-describing, which matters when a dashboard image
+// gets pasted into a deck without its slicer context.
+// -----------------------------------------------------------------------------
+
+Selected Period Title =
+"Marketplace Performance: "
+    & FORMAT ( MIN ( dim_date[date_key] ), "d mmm yyyy" )
+    & " to "
+    & FORMAT ( MAX ( dim_date[date_key] ), "d mmm yyyy" )
+
+
+Headline Summary =
+VAR RoiText = FORMAT ( [ROI], "0.0%" )
+RETURN
+    IF (
+        [ROI] < 0,
+        "Portfolio operating at a loss: " & RoiText & " ROI on "
+            & FORMAT ( [Total Cost], "$#,##0" ) & " of media spend",
+        "Portfolio profitable: " & RoiText & " ROI on "
+            & FORMAT ( [Total Cost], "$#,##0" ) & " of media spend"
+    )
